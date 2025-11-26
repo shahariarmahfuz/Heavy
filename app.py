@@ -1,69 +1,44 @@
 import os
-import threading
 import requests
+import multiprocessing # 🟢 থ্রেডিং বাদ দিয়ে মাল্টিপ্রসেসিং
 from flask import Flask, request, render_template
 
-# ================================================================
-# 🟢 আপনার বটগুলোকে এখানে ইমপোর্ট করুন
-# ================================================================
-import bots.ai_bot as ai_bot
-import bots.test_bot as test_bot
-import bots.info_bot as info_bot  # <--- ১. নতুন বট ইমপোর্ট করলাম
+# বটের রানার ফাংশন ইমপোর্ট
+# নোট: আমরা শুধু রানার ফাংশন ইমপোর্ট করব, গ্লোবাল কিউ নয়
+from bots.ai_bot import run_bot as run_ai_bot, TOKEN as AI_TOKEN
+from bots.test_bot import run_bot as run_test_bot, TOKEN as TEST_TOKEN
+from bots.info_bot import run_bot as run_info_bot, TOKEN as INFO_TOKEN
 
-# ২. এবং এই লিস্টে যোগ করে দিন
-ACTIVE_BOT_MODULES = [
-    ai_bot,
-    test_bot,
-    info_bot  # <--- এখানে নাম যোগ করলাম
-]
-
-# আপনার সার্ভার লিংক
+# সার্ভার কনফিগারেশন
 MY_SERVER_URL = "https://heavy-ztum.onrender.com"
-# ================================================================
 
 app = Flask(__name__)
 
-# এই ডিকশনারিটি অটোমেটিক টোকেন এবং কিউ ম্যাপ করবে
-TOKEN_TO_QUEUE_MAP = {}
+# এই ডিকশনারিটি প্রসেসগুলোর কিউ (Queue) মনে রাখবে
+PROCESS_QUEUES = {}
 
-def setup_all_bots():
-    """সব বট অটোমেটিক সেটআপ করার ফাংশন"""
-    print(f"🚀 Setting up {len(ACTIVE_BOT_MODULES)} bots...")
-
-    for bot_module in ACTIVE_BOT_MODULES:
+def set_webhook(token):
+    """ওয়েব হুক সেট করার ফাংশন"""
+    if MY_SERVER_URL and "http" in MY_SERVER_URL:
+        url = f"{MY_SERVER_URL}/{token}"
         try:
-            # ১. মডিউল থেকে টোকেন এবং কিউ বের করা
-            # (প্রতিটি বটের ফাইলে TOKEN এবং bot_queue থাকতেই হবে)
-            token = bot_module.TOKEN
-            queue = bot_module.bot_queue
-
-            # ২. ম্যাপে রাখা
-            TOKEN_TO_QUEUE_MAP[token] = queue
-
-            # ৩. বটের রানার ফাংশন আলাদা থ্রেডে চালু করা
-            # (প্রতিটি বটের ফাইলে run_bot() ফাংশন থাকতেই হবে)
-            t = threading.Thread(target=bot_module.run_bot, daemon=True)
-            t.start()
-
-            # ৪. ওয়েব হুক সেট করা
-            if MY_SERVER_URL and "http" in MY_SERVER_URL:
-                webhook_url = f"{MY_SERVER_URL}/{token}"
-                requests.get(f"https://api.telegram.org/bot{token}/setWebhook?url={webhook_url}")
-                print(f"✅ Live: Bot ...{token[-5:]}")
-
+            requests.get(f"https://api.telegram.org/bot{token}/setWebhook?url={url}")
+            print(f"✅ Webhook set for: ...{token[-5:]}")
         except Exception as e:
-            print(f"❌ Error setting up a bot: {e}")
-            print("Tip: Ensure the bot file has 'TOKEN', 'bot_queue', and 'run_bot()'")
+            print(f"❌ Webhook failed: {e}")
 
 # --- ডাইনামিক ওয়েব হুক রাউট ---
-# টেলিগ্রাম যখনই কোনো টোকেন লিংকে হিট করবে, এটি অটোমেটিক চিনে নেবে
 @app.route('/<token>', methods=['POST'])
 def global_webhook(token):
-    if token in TOKEN_TO_QUEUE_MAP:
+    # চেক করি এই টোকেনটি আমাদের কোনো প্রসেসের সাথে যুক্ত কিনা
+    if token in PROCESS_QUEUES:
         try:
+            # খুব দ্রুত ডেটা রিসিভ করে কিউতে ফেলে দেওয়া হয়
+            # Flask এখানে ১ মিলিসেকেন্ডও দেরি করবে না
             json_update = request.get_json(force=True)
-            target_queue = TOKEN_TO_QUEUE_MAP[token]
+            target_queue = PROCESS_QUEUES[token]
             target_queue.put(json_update)
+            
             return "OK", 200
         except Exception as e:
             print(f"Webhook Error: {e}")
@@ -71,15 +46,43 @@ def global_webhook(token):
     else:
         return "Unknown Bot Token", 404
 
-# --- ওয়েবসাইট পেজ ---
 @app.route('/')
 def home():
     return render_template('home.html')
 
-if __name__ == "__main__":
-    # সব বট চালু করুন
-    setup_all_bots()
+def start_process(target_func, token, name):
+    """একটি সম্পূর্ণ আলাদা প্রসেস তৈরি করার ফাংশন"""
+    # ১. এই প্রসেসের জন্য একটি আলাদা কিউ তৈরি
+    queue = multiprocessing.Queue()
+    
+    # ২. গ্লোবাল ম্যাপে রাখা (যাতে Flask খুঁজে পায়)
+    PROCESS_QUEUES[token] = queue
+    
+    # ৩. প্রসেস স্টার্ট করা (আর্গুমেন্ট হিসেবে কিউ পাঠানো হচ্ছে)
+    p = multiprocessing.Process(target=target_func, args=(queue,), name=name)
+    p.start()
+    return p
 
-    # সার্ভার রান করুন
+if __name__ == "__main__":
+    # Flask এর রিলোডার সমস্যা এড়াতে মেইন ব্লকে রাখা জরুরি
     PORT = int(os.environ.get("PORT", "8080"))
+
+    print("🚀 Starting Multiprocess Bot System...")
+
+    # ১. AI Bot প্রসেস চালু
+    start_process(run_ai_bot, AI_TOKEN, "AI_Bot_Process")
+
+    # ২. Test Bot প্রসেস চালু
+    start_process(run_test_bot, TEST_TOKEN, "Test_Bot_Process")
+
+    # ৩. Info Bot প্রসেস চালু
+    start_process(run_info_bot, INFO_TOKEN, "Info_Bot_Process")
+
+    # ৪. ওয়েব হুক সেট করা
+    set_webhook(AI_TOKEN)
+    set_webhook(TEST_TOKEN)
+    set_webhook(INFO_TOKEN)
+
+    # ৫. সার্ভার রান
     app.run(host="0.0.0.0", port=PORT)
+
