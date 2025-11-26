@@ -18,7 +18,7 @@ ACTIVE_BOT_MODULES = [
 ]
 
 # আপনার সার্ভার লিংক
-MY_SERVER_URL = "https://7f8abc28-8bb6-45d9-96f9-2f1fb947c58a-00-t8t748thaoal.sisko.replit.dev"
+MY_SERVER_URL = "https://heavy-ztum.onrender.com"
 # ================================================================
 
 app = Flask(__name__)
