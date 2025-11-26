@@ -1,39 +1,61 @@
-import os # os ইমপোর্ট
+import os
 import asyncio
 import queue
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==========================================
-# ⚙️ কনফিগারেশন (সিক্রেট থেকে নেওয়া)
+# ⚙️ কনফিগারেশন
 # ==========================================
 TOKEN = os.getenv("TEST_BOT_TOKEN")
 
-if not TOKEN:
-    print("⚠️ Warning: TEST_BOT_TOKEN not found in Secrets!")
-
-bot_queue = queue.Queue()
+# ==========================================
+# 🔄 ব্যাকগ্রাউন্ড লুপ (আইসোলেটেড)
+# ==========================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("আমি টেস্ট বট! সিক্রেট টোকেন দিয়ে চলছি! 🕵️‍♂️")
+    await update.message.reply_text("আমি টেস্ট বট! আলাদা প্রসেসরে চলছি! 🧪")
 
-async def bot_loop(application):
-    print("🧪 Test Bot Started...")
+async def bot_loop(application, local_queue):
+    """
+    local_queue: app.py থেকে আসা মাল্টিপ্রসেসিং কিউ
+    """
+    print("🧪 Test Bot Process Started...")
     await application.initialize()
     await application.start()
+    
     while True:
         try:
-            update_data = bot_queue.get(timeout=1)
+            # app.py থেকে পাঠানো কিউ চেক করা হচ্ছে
+            update_data = local_queue.get(timeout=1)
+            
             if update_data:
                 update = Update.de_json(update_data, application.bot)
                 await application.process_update(update)
-        except queue.Empty: continue
-        except Exception as e: print(f"Test Bot Error: {e}")
+                
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"Test Bot Error: {e}")
 
-def run_bot():
-    if not TOKEN: return
+# ==========================================
+# 🚀 রানার ফাংশন
+# ==========================================
+
+# ফাংশনটি এখন input_queue গ্রহণ করবে
+def run_bot(input_queue):
+    if not TOKEN:
+        print("❌ Test Bot Token Missing!")
+        return
+
+    # প্রতিটি প্রসেসের জন্য নতুন ইভেন্ট লুপ
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    loop.run_until_complete(bot_loop(app))
+    
+    # লুপে ইনপুট কিউ পাস করা হলো
+    loop.run_until_complete(bot_loop(app, input_queue))
+
+
