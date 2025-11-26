@@ -1,231 +1,199 @@
-# full bot with /newchat command to assign per-user random API UID tokens
 import os
 import asyncio
 import queue
 import logging
 import requests
-import re
 import html
-import json
 import random
 import string
-from pathlib import Path
+import re
+
 from telegram import Update
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
 # ==========================================
-# Config
+# ⚙️ কনফিগারেশন
 # ==========================================
 TOKEN = os.getenv("AI_BOT_TOKEN")
 API_BASE = "https://ai.xneko.xyz"
-REQUEST_TIMEOUT = 30  # seconds
-USER_TOKENS_FILE = Path("user_tokens.json")
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# লগের লেভেল সেট করা
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-# ==========================================
-# User token management (in-memory + persistent)
-# ==========================================
-_user_tokens = {}
-_user_tokens_lock = asyncio.Lock()
-
-def _load_tokens_from_disk():
-    global _user_tokens
-    if USER_TOKENS_FILE.exists():
-        try:
-            with USER_TOKENS_FILE.open("r", encoding="utf-8") as f:
-                _user_tokens = json.load(f)
-        except Exception as e:
-            logger.exception("Failed to load user tokens file, starting fresh.")
-            _user_tokens = {}
-    else:
-        _user_tokens = {}
-
-def _save_tokens_to_disk():
-    try:
-        with USER_TOKENS_FILE.open("w", encoding="utf-8") as f:
-            json.dump(_user_tokens, f)
-    except Exception:
-        logger.exception("Failed to save user tokens to disk")
-
-def generate_random_token(parts=3, part_len=4):
-    """Generate token like ABCD-EFGH-IJKL (uppercase letters+digits)"""
-    alphabet = string.ascii_uppercase + string.digits
-    parts_list = []
-    for _ in range(parts):
-        part = ''.join(random.choice(alphabet) for _ in range(part_len))
-        parts_list.append(part)
-    return '-'.join(parts_list)
-
-async def get_user_token_for_api(user_id: int):
-    """Return existing token or create a new one if not present."""
-    uid_str = str(user_id)
-    async with _user_tokens_lock:
-        token = _user_tokens.get(uid_str)
-        if not token:
-            token = generate_random_token()
-            _user_tokens[uid_str] = token
-            _save_tokens_to_disk()
-        return token
-
-async def set_user_token_for_api(user_id: int, token: str):
-    uid_str = str(user_id)
-    async with _user_tokens_lock:
-        _user_tokens[uid_str] = token
-        _save_tokens_to_disk()
-
-async def force_new_token_for_user(user_id: int):
-    uid_str = str(user_id)
-    new_token = generate_random_token()
-    async with _user_tokens_lock:
-        _user_tokens[uid_str] = new_token
-        _save_tokens_to_disk()
-    return new_token
-
-# initialize tokens on startup
-_load_tokens_from_disk()
+# ইউজারদের সেশন বা চ্যাট আইডি স্টোর করার জন্য ডিকশনারি
+# Structure: { telegram_user_id: "SESSION_ID" }
+user_sessions = {}
 
 # ==========================================
-# Utilities for typing/action and HTML safety
+# 🛠️ ইউটিলিটি ফাংশন (আইডি জেনারেশন)
+# ==========================================
+def generate_session_id():
+    """
+    RANDO-RANDO-RANDO ফরম্যাটে আইডি জেনারেট করে।
+    উদাহরণ: SJHD-JSJE-KWJS
+    """
+    def get_chunk():
+        return ''.join(random.choices(string.ascii_uppercase, k=4))
+    
+    return f"{get_chunk()}-{get_chunk()}-{get_chunk()}"
+
+def get_current_uid(user_id):
+    """ইউজারের বর্তমান সেশন আইডি রিটার্ন করে, না থাকলে টেলিগ্রাম আইডি দেয়"""
+    return user_sessions.get(user_id, str(user_id))
+
+# ==========================================
+# 🛠️ ইউটিলিটি ফাংশন (টাইপিং এবং ফরম্যাটিং)
 # ==========================================
 async def keep_sending_action(bot, chat_id, action):
+    """রেসপন্স না আসা পর্যন্ত টাইপিং স্ট্যাটাস দেখাবে"""
     try:
         while True:
             await bot.send_chat_action(chat_id=chat_id, action=action)
             await asyncio.sleep(4)
     except asyncio.CancelledError:
-        return
+        pass
 
-def smart_segment_split_for_chunks(segments, max_len=4000):
-    chunks = []
-    current = ""
-    for seg in segments:
-        if len(seg) > max_len:
-            start = 0
-            while start < len(seg):
-                end = min(start + max_len, len(seg))
-                if end < len(seg):
-                    nl = seg.rfind('\n', start, end)
-                    if nl > start:
-                        end = nl + 1
-                piece = seg[start:end]
-                if current and len(current) + len(piece) > max_len:
-                    chunks.append(current)
-                    current = ""
-                current += piece
-                if len(current) >= max_len:
-                    chunks.append(current)
-                    current = ""
-                start = end
-            continue
+def parse_and_format_content(text):
+    """
+    AI এর মার্কডাউন রেসপন্সকে টেলিগ্রাম সাপোর্টেড HTML এ কনভার্ট করে।
+    এটি কোড ব্লকগুলো (```code```) কে <pre><code>...</code></pre> এ রূপান্তর করে।
+    """
+    parts = re.split(r'(```.*?```)', text, flags=re.DOTALL)
+    formatted_parts = []
 
-        if len(current) + len(seg) <= max_len:
-            current += seg
+    for part in parts:
+        if part.startswith('```') and part.endswith('```'):
+            # এটি একটি কোড ব্লক
+            content = part[3:-3].strip()
+            # ল্যাঙ্গুয়েজ ডিটেকশন (যদি থাকে, যেমন ```python)
+            first_line_break = content.find('\n')
+            lang = ""
+            if first_line_break > -1:
+                possible_lang = content[:first_line_break].strip()
+                # সাধারণ ল্যাঙ্গুয়েজ নাম চেক (স্পেস বা স্পেশাল ক্যারেক্টার বাদে)
+                if possible_lang and possible_lang.isalnum() and len(possible_lang) < 15:
+                    lang = f' class="language-{possible_lang}"'
+                    content = content[first_line_break+1:]
+            
+            # কোডের ভেতরের স্পেশাল ক্যারেক্টার এস্কেপ করা (যেমন <, >, &)
+            escaped_content = html.escape(content)
+            formatted_parts.append(f'<pre><code{lang}>{escaped_content}</code></pre>')
         else:
-            chunks.append(current)
-            current = seg
-    if current:
-        chunks.append(current)
-    return chunks
+            # এটি সাধারণ টেক্সট, এখানেও এস্কেপ করতে হবে
+            if part.strip():
+                # বোল্ড টেক্সট হ্যান্ডেল করা (**text** -> <b>text</b>)
+                part = html.escape(part)
+                part = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', part)
+                formatted_parts.append(part)
 
-def prepare_html_chunks(raw_text, max_len=4000):
-    pre_re = re.compile(r'(?is)<pre(?:\s[^>]*)?>(.*?)</pre>')
-    segments = []
-    last_idx = 0
+    return "".join(formatted_parts)
 
-    for m in pre_re.finditer(raw_text):
-        start, end = m.span()
-        inner = m.group(1)
-        if start > last_idx:
-            outside = raw_text[last_idx:start]
-            if outside:
-                segments.append(html.escape(outside))
-
-        escaped_inner = html.escape(inner)
-        code_block = f"<pre><code>{escaped_inner}</code></pre>"
-        segments.append(code_block)
-        last_idx = end
-
-    if last_idx < len(raw_text):
-        tail = raw_text[last_idx:]
-        if tail:
-            segments.append(html.escape(tail))
-
-    chunks = smart_segment_split_for_chunks(segments, max_len=max_len)
-    return chunks
-
-async def send_html_safe_message(chat_id, text, bot):
-    chunks = prepare_html_chunks(text, max_len=4000)
-    for chunk in chunks:
-        try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=chunk,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True
-            )
-        except Exception as e:
-            logger.warning(f"HTML send failed: {e}. Falling back to plaintext for this chunk.")
-            plain = re.sub(r'<[^>]+>', '', chunk)
-            plain = html.unescape(plain)
-            try:
-                await bot.send_message(chat_id=chat_id, text=plain)
-            except Exception as e2:
-                logger.exception(f"Plain text fallback also failed: {e2}")
-
-# ==========================================
-# /newchat command handler
-# ==========================================
-async def newchat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_smart_split_message(chat_id, text, bot):
     """
-    When user sends /newchat, assign a new random token and inform them.
-    That token will be used as uid in subsequent API requests.
+    বড় মেসেজগুলো এমনভাবে ভাগ করে পাঠায় যেন HTML ট্যাগ বা কোড ব্লক ভেঙে না যায়।
     """
-    msg = update.effective_message
-    user = update.effective_user
-    if not user:
+    # প্রথমে পুরো টেক্সটকে HTML এ ফরম্যাট করে নিই
+    formatted_text = parse_and_format_content(text)
+    
+    max_len = 4000
+    if len(formatted_text) <= max_len:
+        await bot.send_message(chat_id=chat_id, text=formatted_text, parse_mode=ParseMode.HTML)
         return
 
-    new_token = await force_new_token_for_user(user.id)
-    await msg.reply_text(
-        f"✅ New chat token generated for you:\n`{new_token}`\n\n"
-        "This token will be used for your subsequent requests.",
-        parse_mode=ParseMode.MARKDOWN
+    # যদি মেসেজ বড় হয়, তবে লাইন বাই লাইন স্প্লিট লজিক
+    lines = formatted_text.split('\n')
+    chunk = ""
+    in_code_block = False
+    code_lang = ""
+
+    for line in lines:
+        # বর্তমান লাইন যোগ করলে যদি লিমিট পার হয়ে যায়
+        if len(chunk) + len(line) + 1 > max_len:
+            # যদি কোড ব্লকের ভেতরে থাকি, তাহলে ট্যাগ ক্লোজ করে পাঠাতে হবে
+            if in_code_block:
+                chunk += "</code></pre>"
+            
+            # মেসেজ পাঠানো
+            try:
+                await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                # ফলব্যাক: যদি পার্সিং এরর হয়, প্লেইন টেক্সট হিসেবে পাঠানো
+                await bot.send_message(chat_id=chat_id, text=chunk.replace('<', ''), parse_mode=None)
+
+            # নতুন চাঙ্ক শুরু
+            chunk = ""
+            # যদি কোড ব্লক আগে ওপেন ছিল, পরের মেসেজে আবার ওপেন করতে হবে
+            if in_code_block:
+                chunk += f'<pre><code{code_lang}>'
+        
+        # কোড ব্লক ডিটেকশন (ম্যানুয়ালি ট্যাগ দেখে)
+        if '<pre><code' in line:
+            in_code_block = True
+            # ল্যাঙ্গুয়েজ ক্লাস সেভ করে রাখা
+            match = re.search(r'<code( class="[^"]*")?>', line)
+            if match and match.group(1):
+                code_lang = match.group(1)
+            else:
+                code_lang = ""
+        
+        if '</code></pre>' in line:
+            in_code_block = False
+
+        chunk += line + "\n"
+
+    # বাকি অংশ পাঠানো
+    if chunk:
+        try:
+            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML)
+        except Exception:
+            await bot.send_message(chat_id=chat_id, text=chunk.replace('<', ''), parse_mode=None)
+
+# ==========================================
+# 🤖 কমান্ড হ্যান্ডলার (/newchat)
+# ==========================================
+async def new_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    new_session_id = generate_session_id()
+    
+    # সেশন সেভ করা
+    user_sessions[user_id] = new_session_id
+    
+    await update.message.reply_text(
+        f"✅ <b>New Chat Started!</b>\n\n"
+        f"👤 Your new Identity ID: <code>{new_session_id}</code>\n"
+        f"Previous context has been cleared.",
+        parse_mode=ParseMode.HTML
+    )
+    logging.info(f"User {user_id} switched to new session: {new_session_id}")
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hello! I am ready. Send me a message or photo.\n"
+        "Use /newchat to reset the conversation context."
     )
 
-async def mytoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Optional: show current token for user."""
-    msg = update.effective_message
-    user = update.effective_user
-    if not user:
-        return
-    token = await get_user_token_for_api(user.id)
-    await msg.reply_text(f"Your current chat token: `{token}`", parse_mode=ParseMode.MARKDOWN)
-
 # ==========================================
-# Main message handler (uses per-user token)
+# 🤖 মেইন মেসেজ হ্যান্ডলার
 # ==========================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    if not msg:
-        return
-
+    if not msg: return
+    
     chat_id = msg.chat_id
-    user = msg.from_user
-    if not user:
-        return
-
+    user_id = msg.from_user.id
     has_photo = bool(msg.photo)
     text = msg.caption if has_photo else msg.text
+    
+    if not text and not has_photo: return
 
-    if not text and not has_photo:
-        return
-
-    # get the per-user token (this will create one if not exist)
-    api_uid = await get_user_token_for_api(user.id)
-
+    # সেশন আইডি বের করা (যদি /newchat দিয়ে সেট করা থাকে, নাহলে ডিফল্ট আইডি)
+    current_uid = get_current_uid(user_id)
+    
+    # অ্যাকশন
     action = ChatAction.UPLOAD_PHOTO if has_photo else ChatAction.TYPING
     typing_task = asyncio.create_task(keep_sending_action(context.bot, chat_id, action))
 
@@ -235,90 +203,90 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
 
         if should_use_post:
-            logger.info("[%s] Sending POST request (image: %s)", api_uid, has_photo)
-            data = {'uid': str(api_uid)}
-            if text:
-                data['q'] = text
-
-            files = None
+            logging.info(f"[{current_uid}] Sending POST request (Image: {has_photo})")
+            data = {'uid': current_uid}
+            if text: data['q'] = text
+            
+            files = {}
             if has_photo:
                 photo_file = await msg.photo[-1].get_file()
                 image_bytes = await photo_file.download_as_bytearray()
-                files = {'image': ('image.jpg', image_bytes, 'image/jpeg')}
+                files['image'] = ('image.jpg', image_bytes, 'image/jpeg')
 
-            def do_post():
-                try:
-                    return requests.post(f"{API_BASE}/ask", data=data, files=files, timeout=REQUEST_TIMEOUT)
-                finally:
-                    pass
-
-            resp = await loop.run_in_executor(None, do_post)
+            resp = await loop.run_in_executor(
+                None, 
+                lambda: requests.post(f"{API_BASE}/ask", data=data, files=files if files else None)
+            )
         else:
-            logger.info("[%s] Sending GET request", api_uid)
-            params = {'q': text, 'uid': api_uid}
-            def do_get():
-                return requests.get(f"{API_BASE}/ask", params=params, timeout=REQUEST_TIMEOUT)
-            resp = await loop.run_in_executor(None, do_get)
+            logging.info(f"[{current_uid}] Sending GET request")
+            params = {'q': text, 'uid': current_uid}
+            
+            resp = await loop.run_in_executor(
+                None,
+                lambda: requests.get(f"{API_BASE}/ask", params=params)
+            )
 
-        try:
+        try: 
             response_data = resp.json()
-        except Exception:
+        except: 
             response_data = {"status": "success", "text": resp.text}
+
+        typing_task.cancel()
 
         if not response_data:
             await context.bot.send_message(chat_id, "❌ Empty response from API")
             return
 
         final_response = response_data.get("text") or response_data.get("output") or "No response text"
-
-        typing_task.cancel()
-        try:
-            await asyncio.wait_for(typing_task, timeout=1.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            pass
-
-        await send_html_safe_message(chat_id, final_response, context.bot)
+        
+        # ফরম্যাটেড মেসেজ পাঠানো
+        await send_smart_split_message(chat_id, final_response, context.bot)
 
     except Exception as e:
-        logger.exception("Handler Error")
+        logging.error(f"Handler Error: {e}")
         typing_task.cancel()
-        try:
-            await asyncio.wait_for(typing_task, timeout=1.0)
-        except Exception:
-            pass
-        await context.bot.send_message(chat_id, f"❌ Bot Error: {str(e)}")
+        await context.bot.send_message(chat_id, f"❌ Error: {str(e)}")
 
 # ==========================================
-# Runner
+# 🔄 রানার ফাংশন
 # ==========================================
 async def bot_loop(application, local_queue):
-    logger.info("AI Bot Process Started (Isolated)...")
+    logging.info("🤖 AI Bot Process Started...")
     await application.initialize()
     await application.start()
 
     while True:
         try:
+            # কিউ থেকে আপডেট নেওয়া (যদি মাল্টিপ্রসেসিং ব্যবহার করেন)
+            # সাধারণ চালানোর জন্য এটি ব্লকিং হতে পারে, তাই timeout ব্যবহার করা হলো
             update_data = local_queue.get(timeout=1)
             if update_data:
                 update = Update.de_json(update_data, application.bot)
                 await application.process_update(update)
         except queue.Empty:
+            # কিউ খালি থাকলে লুপ কন্টিনিউ করবে (CPU idle রাখার জন্য সামান্য স্লিপ দেওয়া যেতে পারে)
+            await asyncio.sleep(0.1) 
             continue
-        except Exception:
-            logger.exception("AI Bot Loop Error")
+        except Exception as e:
+            logging.error(f"AI Bot Loop Error: {e}")
 
 def run_bot(input_queue):
     if not TOKEN:
         print("❌ AI Bot Token Missing!")
         return
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    # ইভেন্ট লুপ সেটআপ
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
     app = Application.builder().token(TOKEN).build()
-    # add handlers
-    app.add_handler(CommandHandler("newchat", newchat_command))
-    app.add_handler(CommandHandler("mytoken", mytoken_command))  # optional
+    
+    # হ্যান্ডলার রেজিস্ট্রেশন
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("newchat", new_chat_command)) # নতুন ফিচার
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
 
     loop.run_until_complete(bot_loop(app, input_queue))
