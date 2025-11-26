@@ -1,6 +1,6 @@
 import os
 import asyncio
-import queue
+import queue  # এটি queue.Empty এরর চেক করার জন্য লাগবে
 import logging
 import requests
 import html
@@ -12,20 +12,21 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 # ⚙️ কনফিগারেশন
 # ==========================================
 # নাম অবশ্যই TOKEN হতে হবে
-TOKEN = os.getenv("AI_BOT_TOKEN")  
+TOKEN = os.getenv("AI_BOT_TOKEN")
 API_BASE = "https://ai.xneko.xyz"
 
-# নাম অবশ্যই bot_queue হতে হবে
-bot_queue = queue.Queue()
+# 🔴 নোট: এখানে আর গ্লোবাল bot_queue নেই। 
+# কিউ এখন run_bot ফাংশনের মাধ্যমে আসবে।
 
 # লগিং
 logging.basicConfig(level=logging.INFO)
 
 # ==========================================
-# 🛠️ ইউটিলিটি ফাংশন
+# 🛠️ ইউটিলিটি ফাংশন (মেসেজ ফরম্যাটিং)
 # ==========================================
 
 def smart_split(text, max_len=4000):
+    """মেসেজ ভেঙে ফেলার স্মার্ট ফাংশন"""
     if len(text) <= max_len:
         return [text]
 
@@ -54,6 +55,7 @@ def smart_split(text, max_len=4000):
     return chunks
 
 async def send_html_safe_message(chat_id, text, bot):
+    """HTML ফরম্যাটে মেসেজ পাঠায়"""
     clean_text = text.replace("```", "")
     chunks = smart_split(clean_text)
 
@@ -124,34 +126,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id, f"❌ Bot Error: {str(e)}")
 
 # ==========================================
-# 🔄 ব্যাকগ্রাউন্ড লুপ এবং রানার
+# 🔄 ব্যাকগ্রাউন্ড লুপ এবং রানার (Multiprocessing)
 # ==========================================
 
-async def bot_loop(application):
-    print("🤖 AI Bot Worker Started...")
+async def bot_loop(application, local_queue):
+    """
+    local_queue: এটি app.py থেকে আসা মাল্টিপ্রসেসিং কিউ
+    """
+    print("🤖 AI Bot Process Started (Isolated)...")
     await application.initialize()
     await application.start()
 
     while True:
         try:
-            # এখানে bot_queue ব্যবহার করা হচ্ছে
-            update_data = bot_queue.get(timeout=1)
+            # app.py থেকে পাঠানো কিউ চেক করা হচ্ছে
+            update_data = local_queue.get(timeout=1)
+
             if update_data:
                 update = Update.de_json(update_data, application.bot)
                 await application.process_update(update)
+
         except queue.Empty:
             continue
         except Exception as e:
             print(f"AI Bot Loop Error: {e}")
 
-# ফাংশনের নাম অবশ্যই run_bot হতে হবে
-def run_bot():
+# ফাংশনটি এখন একটি প্যারামিটার (input_queue) গ্রহণ করবে
+def run_bot(input_queue):
+    if not TOKEN: 
+        print("❌ AI Bot Token Missing!")
+        return
+
+    # প্রতিটি প্রসেসের জন্য নতুন ইভেন্ট লুপ
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # এখানে TOKEN ব্যবহার করা হচ্ছে
     app = Application.builder().token(TOKEN).build()
-
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
 
-    loop.run_until_complete(bot_loop(app))
+    # লুপে ইনপুট কিউ পাস করা হলো
+    loop.run_until_complete(bot_loop(app, input_queue))
+
+
